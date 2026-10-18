@@ -1,3 +1,4 @@
+
 # Shared Arithmetic Engine — Milestone 1
 
 ## Purpose
@@ -57,3 +58,7 @@ A successful run ends with `ALL TESTS PASSED`.
 ## Integration contract
 
 The algorithm sequencer should present stable opcode/operands while `cmd_valid` is asserted and only consider the command accepted on `cmd_valid && cmd_ready`. It should wait for `result_valid` before consuming `result` and `overflow`.
+=======
+# FPGA-DSP-Accelerator
+A fixed-point FPGA DSP accelerator implementing LMS, NLMS, and Kalman filtering using System-Verilog, a shared arithmetic engine, and modular control logic.
+
