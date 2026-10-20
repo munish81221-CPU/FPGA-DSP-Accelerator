@@ -56,41 +56,61 @@ module arithmetic_engine #(
     // Convert a signed Q30 value to Q1.15 using round-to-nearest, ties away from zero,
     // then saturate to the signed 16-bit range. ACC_W=40 and DATA_W=16 are the intended
     // project configuration; the slice/scale convention is Q30 -> Q15 (shift by 15).
-    function automatic logic signed [DATA_W-1:0] q30_to_q15_sat(
-        input logic signed [ACC_W-1:0] value
-    );
-        logic signed [ACC_W:0] rounded;
-        logic signed [ACC_W:0] scaled;
-        begin
-            if (value[ACC_W-1])
-                rounded = $signed({value[ACC_W-1], value}) - (1 <<< 14);
-            else
-                rounded = $signed({value[ACC_W-1], value}) + (1 <<< 14);
 
-            scaled = rounded >>> 15;
-            if (scaled > 32767)
-                q30_to_q15_sat = {1'b0, {(DATA_W-1){1'b1}}};
-            else if (scaled < -32768)
-                q30_to_q15_sat = {1'b1, {(DATA_W-1){1'b0}}};
-            else
-                q30_to_q15_sat = scaled[DATA_W-1:0];
-        end
-    endfunction
 
-    function automatic logic q30_to_q15_overflow(
-        input logic signed [ACC_W-1:0] value
-    );
-        logic signed [ACC_W:0] rounded;
-        logic signed [ACC_W:0] scaled;
-        begin
-            if (value[ACC_W-1])
-                rounded = $signed({value[ACC_W-1], value}) - (1 <<< 14);
-            else
-                rounded = $signed({value[ACC_W-1], value}) + (1 <<< 14);
-            scaled = rounded >>> 15;
-            q30_to_q15_overflow = (scaled > 32767) || (scaled < -32768);
-        end
-    endfunction
+function automatic logic signed [DATA_W-1:0] q30_to_q15_sat(
+    input logic signed [ACC_W-1:0] value
+);
+    logic signed [ACC_W:0] rounded;
+    logic signed [ACC_W:0] scaled;
+
+    begin
+        // Round to nearest, with exact half-way cases rounded away from zero.
+        if (value[ACC_W-1])
+            rounded = $signed({value[ACC_W-1], value})
+                      + ((1 <<< 14) - 1);
+        else
+            rounded = $signed({value[ACC_W-1], value})
+                      + (1 <<< 14);
+
+        scaled = rounded >>> 15;
+
+        if (scaled > 32767)
+            q30_to_q15_sat = {1'b0, {(DATA_W-1){1'b1}}};
+        else if (scaled < -32768)
+            q30_to_q15_sat = {1'b1, {(DATA_W-1){1'b0}}};
+        else
+            q30_to_q15_sat = scaled[DATA_W-1:0];
+    end
+endfunction
+
+
+
+
+function automatic logic q30_to_q15_overflow(
+    input logic signed [ACC_W-1:0] value
+);
+    logic signed [ACC_W:0] rounded;
+    logic signed [ACC_W:0] scaled;
+
+    begin
+        // Round to nearest, with exact half-way cases rounded away from zero.
+        if (value[ACC_W-1])
+            rounded = $signed({value[ACC_W-1], value})
+                      + ((1 <<< 14) - 1);
+        else
+            rounded = $signed({value[ACC_W-1], value})
+                      + (1 <<< 14);
+
+        scaled = rounded >>> 15;
+
+        q30_to_q15_overflow =
+            (scaled > 32767) || (scaled < -32768);
+    end
+endfunction
+
+
+
 
     function automatic logic signed [DATA_W-1:0] q15_saturate(
         input logic signed [DATA_W:0] value
@@ -110,6 +130,9 @@ module arithmetic_engine #(
             q15_overflow = (value > 32767) || (value < -32768);
         end
     endfunction
+
+
+    
 
     always_ff @(posedge clk) begin
         if (!rst_n) begin
