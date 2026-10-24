@@ -1,22 +1,14 @@
 // Sequential signed fixed-point restoring divider.
-// Computes quotient_raw = (numerator_raw * 2**FRACTION_BITS) / denominator_raw.
-// The quotient is truncated toward zero and saturated to QUOT_W signed bits.
-// start is accepted only while idle; done is a one-clock pulse.
-// Active-low synchronous reset.
-//
-// NLMS example configuration:
-// NUM_W=16, DEN_W=32, QUOT_W=32, FRACTION_BITS=42
-// numerator_raw: mu in Q1.15
-// denominator_raw: delta + input energy in raw Q2.30 units
-// quotient: normalized mu in Q5.27 (because Qraw = mu_raw*2^42/denominator_raw).
-//
-// Constraint: NUM_W + FRACTION_BITS >= DEN_W and QUOT_W <= NUM_W+FRACTION_BITS.
+// Computes quotient_raw = (numerator_raw * 2**SCALE_SHIFT) / denominator_raw.
+
+
+
 
 module divider_unit #(
     parameter int NUM_W = 16,
-    parameter int DEN_W = 16,
-    parameter int QUOT_W = 24,
-    parameter int FRACTION_BITS = 8
+    parameter int DEN_W = 32,
+    parameter int QUOT_W = 32,
+    parameter int SCALE_SHIFT = 41
 ) (
     input  logic                     clk,
     input  logic                     rst_n,
@@ -30,7 +22,7 @@ module divider_unit #(
     output logic                     overflow
 );
 
-    localparam int DIV_W = NUM_W + FRACTION_BITS;
+    localparam int DIV_W = NUM_W + SCALE_SHIFT;   
     localparam int COUNT_W = $clog2(DIV_W + 1);
 
     typedef enum logic [1:0] {DIV_IDLE, DIV_RUN, DIV_FINISH} state_t;
@@ -48,7 +40,13 @@ module divider_unit #(
     logic [DIV_W-1:0] max_positive;
     logic [DIV_W-1:0] max_negative_magnitude;
 
-    function automatic logic [NUM_W-1:0] abs_num(
+
+//below two functions are used to get absolute values of numerator and denominator it works as---
+//When the original number is nonnegative, the function takes its lower NUM_W bits directly. 
+//When the original number is negative, it first negates the extended value to calculate the positive magnitude.
+
+
+    function automatic logic [NUM_W-1:0] abs_num(  //abs->absolute value 
         input logic signed [NUM_W-1:0] value
     );
         logic signed [NUM_W:0] extended;
@@ -110,10 +108,11 @@ module divider_unit #(
                         if (denominator == '0) begin
                             div_by_zero <= 1'b1;
                             state       <= DIV_FINISH;
-                        end else begin
+                        end 
+                        else begin
                             dividend_shift <=
                                 {{(DIV_W-NUM_W){1'b0}}, abs_num(numerator)}
-                                << FRACTION_BITS;
+                                << SCALE_SHIFT;
                             quotient_work  <= '0;
                             remainder_work <= '0;
                             divisor_abs    <=
@@ -131,7 +130,8 @@ module divider_unit #(
                     if (trial_remainder >= divisor_abs) begin
                         remainder_work <= trial_remainder - divisor_abs;
                         quotient_work  <= {quotient_work[DIV_W-2:0], 1'b1};
-                    end else begin
+                    end
+                    else begin
                         remainder_work <= trial_remainder;
                         quotient_work  <= {quotient_work[DIV_W-2:0], 1'b0};
                     end
@@ -141,30 +141,47 @@ module divider_unit #(
                     bit_count <= bit_count - 1'b1;
                 end
 
-                DIV_FINISH: begin
-                    if (!div_by_zero) begin
-                        if (quotient_negative) begin
-                            if (quotient_magnitude > max_negative_magnitude) begin
-                                quotient <= {1'b1, {(QUOT_W-1){1'b0}}};
-                                overflow <= 1'b1;
-                            end else begin
-                                quotient <= -$signed(quotient_magnitude[QUOT_W-1:0]);
-                                overflow <= 1'b0;
-                            end
-                        end else begin
-                            if (quotient_magnitude > max_positive) begin
-                                quotient <= {1'b0, {(QUOT_W-1){1'b1}}};
-                                overflow <= 1'b1;
-                            end else begin
-                                quotient <= $signed(quotient_magnitude[QUOT_W-1:0]);
-                                overflow <= 1'b0;
-                            end
+            DIV_FINISH: begin
+                if (!div_by_zero) begin
+                    if (quotient_negative) begin
+                        // Negative output range:
+                        // -2^(QUOT_W-1) to -1
+
+                        if (quotient_magnitude > max_negative_magnitude) begin
+                            quotient <= {1'b1, {(QUOT_W-1){1'b0}}};
+                            overflow <= 1'b1;
+                        end
+                    else begin
+                        if (quotient_magnitude == max_negative_magnitude) begin
+                            // Exact minimum signed value: -2^(QUOT_W-1)
+                            quotient <= {1'b1, {(QUOT_W-1){1'b0}}};
+                        end
+                        else begin
+                            // Magnitude fits in a positive signed value.
+                            quotient <= -$signed(quotient_magnitude[QUOT_W-1:0]);
+                        end
+
+                        overflow <= 1'b0;
+                    end   
+                    end
+                    else begin
+                        // Positive output range:
+                        // 0 to 2^(QUOT_W-1)-1
+
+                        if (quotient_magnitude > max_positive) begin
+                            quotient <= {1'b0, {(QUOT_W-1){1'b1}}};
+                            overflow <= 1'b1;
+                        end
+                        else begin
+                            quotient <= $signed(quotient_magnitude[QUOT_W-1:0]);
+                            overflow <= 1'b0;
                         end
                     end
-                    done  <= 1'b1;
-                    state <= DIV_IDLE;
                 end
 
+                done  <= 1'b1;
+                state <= DIV_IDLE;
+            end   
                 default: state <= DIV_IDLE;
             endcase
         end

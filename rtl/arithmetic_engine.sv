@@ -17,10 +17,14 @@ module arithmetic_engine #(
     input  logic signed [DATA_W-1:0]     operand_a,
     input  logic signed [DATA_W-1:0]     operand_b,
 
+  
     output logic signed [DATA_W-1:0]     result,
+    output logic signed [ACC_W-1:0]      accumulator_value,
     output logic                         result_valid,
     output logic                         busy,
     output logic                         overflow
+
+
 );
 
     localparam logic [2:0] OP_MUL       = 3'b000;
@@ -33,6 +37,7 @@ module arithmetic_engine #(
     logic [2:0]               opcode_q;
     logic signed [DATA_W-1:0] operand_a_q, operand_b_q;
     logic signed [ACC_W-1:0]  accumulator_q;
+    assign accumulator_value = accumulator_q;
 
     // Q1.15 x Q1.15 -> Q2.30. This implementation is parameterized for DATA_W,
     // but the product/accumulator sizing below is intentionally designed for DATA_W=16.
