@@ -71,7 +71,11 @@ module kalman_2state_ip (
     logic signed [39:0] p00_next, p01_next, p11_next;
 
     logic signed [63:0] t0, t1, t2, t3, wide_sum;
+    // Explicitly widen covariance numerators before the Q30-to-Q15 gain shift.
+    logic signed [63:0] gain_num0, gain_num1;
     logic local_overflow;
+    // Diagnostic only: identifies the last overflow condition detected.
+    logic [7:0] overflow_stage;
 
     function automatic logic signed [63:0] round_shift(
         input logic signed [63:0] value,
@@ -130,6 +134,7 @@ module kalman_2state_ip (
             done           <= 1'b0;
             error_status   <= 1'b0;
             overflow_seen  <= 1'b0;
+            overflow_stage <= 8'd0;
             state0         <= '0;
             state1         <= '0;
             p00            <= '0;
@@ -158,6 +163,8 @@ module kalman_2state_ip (
             f00_r <= '0; f01_r <= '0; f10_r <= '0; f11_r <= '0;
             q00_r <= '0; q01_r <= '0; q11_r <= '0; r_r <= '0;
             h0_r <= '0; h1_r <= '0; z_r <= '0;
+            gain_num0 <= '0;
+            gain_num1 <= '0;
         end else begin
             done <= 1'b0;
             if (state == ST_IDLE) begin
@@ -179,6 +186,7 @@ module kalman_2state_ip (
                     z_r <= measurement;
                     error_status <= 1'b0;
                     overflow_seen <= 1'b0;
+                    overflow_stage <= 8'd0;
                     state <= ST_PRED_X;
                 end else if (start && !initialized) begin
                     error_status <= 1'b1;
@@ -192,14 +200,14 @@ module kalman_2state_ip (
                         wide_sum = round_shift(t0 + t1, 14);
                         x0_pred <= sat16(wide_sum);
                         if (!((wide_sum <= 32767) && (wide_sum >= -32768)))
-                            overflow_seen <= 1'b1;
+                            begin overflow_seen <= 1'b1; overflow_stage <= 8'd1; end
 
                         t2 = 64'($signed(f10_r)) * 64'($signed(state0));
                         t3 = 64'($signed(f11_r)) * 64'($signed(state1));
                         wide_sum = round_shift(t2 + t3, 14);
                         x1_pred <= sat16(wide_sum);
                         if (!((wide_sum <= 32767) && (wide_sum >= -32768)))
-                            overflow_seen <= 1'b1;
+                            begin overflow_seen <= 1'b1; overflow_stage <= 8'd2; end
                         state <= ST_PRED_P1;
                     end
 
@@ -209,25 +217,25 @@ module kalman_2state_ip (
                         t1 = round_shift(64'($signed(f01_r)) * 64'($signed(p01)), 14);
                         wide_sum = t0 + t1;
                         a00 <= sat40(wide_sum);
-                        if (!fits40(wide_sum)) overflow_seen <= 1'b1;
+                        if (!fits40(wide_sum)) begin overflow_seen <= 1'b1; overflow_stage <= 8'd3; end
 
                         t0 = round_shift(64'($signed(f00_r)) * 64'($signed(p01)), 14);
                         t1 = round_shift(64'($signed(f01_r)) * 64'($signed(p11)), 14);
                         wide_sum = t0 + t1;
                         a01 <= sat40(wide_sum);
-                        if (!fits40(wide_sum)) overflow_seen <= 1'b1;
+                        if (!fits40(wide_sum)) begin overflow_seen <= 1'b1; overflow_stage <= 8'd4; end
 
                         t0 = round_shift(64'($signed(f10_r)) * 64'($signed(p00)), 14);
                         t1 = round_shift(64'($signed(f11_r)) * 64'($signed(p01)), 14);
                         wide_sum = t0 + t1;
                         a10 <= sat40(wide_sum);
-                        if (!fits40(wide_sum)) overflow_seen <= 1'b1;
+                        if (!fits40(wide_sum)) begin overflow_seen <= 1'b1; overflow_stage <= 8'd5; end
 
                         t0 = round_shift(64'($signed(f10_r)) * 64'($signed(p01)), 14);
                         t1 = round_shift(64'($signed(f11_r)) * 64'($signed(p11)), 14);
                         wide_sum = t0 + t1;
                         a11 <= sat40(wide_sum);
-                        if (!fits40(wide_sum)) overflow_seen <= 1'b1;
+                        if (!fits40(wide_sum)) begin overflow_seen <= 1'b1; overflow_stage <= 8'd6; end
                         state <= ST_PRED_P2;
                     end
 
@@ -237,19 +245,19 @@ module kalman_2state_ip (
                         t1 = round_shift(64'($signed(a01)) * 64'($signed(f01_r)), 14);
                         wide_sum = t0 + t1 + $signed(q00_r);
                         pp00 <= sat40(wide_sum);
-                        if (!fits40(wide_sum)) overflow_seen <= 1'b1;
+                        if (!fits40(wide_sum)) begin overflow_seen <= 1'b1; overflow_stage <= 8'd7; end
 
                         t0 = round_shift(64'($signed(a00)) * 64'($signed(f10_r)), 14);
                         t1 = round_shift(64'($signed(a01)) * 64'($signed(f11_r)), 14);
                         wide_sum = t0 + t1 + $signed(q01_r);
                         pp01 <= sat40(wide_sum);
-                        if (!fits40(wide_sum)) overflow_seen <= 1'b1;
+                        if (!fits40(wide_sum)) begin overflow_seen <= 1'b1; overflow_stage <= 8'd8; end
 
                         t0 = round_shift(64'($signed(a10)) * 64'($signed(f10_r)), 14);
                         t1 = round_shift(64'($signed(a11)) * 64'($signed(f11_r)), 14);
                         wide_sum = t0 + t1 + $signed(q11_r);
                         pp11 <= sat40(wide_sum);
-                        if (!fits40(wide_sum)) overflow_seen <= 1'b1;
+                        if (!fits40(wide_sum)) begin overflow_seen <= 1'b1; overflow_stage <= 8'd9; end
                         state <= ST_INNOV;
                     end
 
@@ -261,20 +269,20 @@ module kalman_2state_ip (
                         wide_sum = $signed(z_r) - wide_sum;
                         innov_r <= sat16(wide_sum);
                         if (!((wide_sum <= 32767) && (wide_sum >= -32768)))
-                            overflow_seen <= 1'b1;
+                            begin overflow_seen <= 1'b1; overflow_stage <= 8'd10; end
 
                         // HP = H*Ppred; return to Q30.
                         t0 = round_shift(64'($signed(h0_r)) * 64'($signed(pp00)), 14);
                         t1 = round_shift(64'($signed(h1_r)) * 64'($signed(pp01)), 14);
                         wide_sum = t0 + t1;
                         hp0 <= sat40(wide_sum);
-                        if (!fits40(wide_sum)) overflow_seen <= 1'b1;
+                        if (!fits40(wide_sum)) begin overflow_seen <= 1'b1; overflow_stage <= 8'd11; end
 
                         t0 = round_shift(64'($signed(h0_r)) * 64'($signed(pp01)), 14);
                         t1 = round_shift(64'($signed(h1_r)) * 64'($signed(pp11)), 14);
                         wide_sum = t0 + t1;
                         hp1 <= sat40(wide_sum);
-                        if (!fits40(wide_sum)) overflow_seen <= 1'b1;
+                        if (!fits40(wide_sum)) begin overflow_seen <= 1'b1; overflow_stage <= 8'd12; end
                         state <= ST_INNOV_COV;
                     end
 
@@ -284,7 +292,7 @@ module kalman_2state_ip (
                         t1 = round_shift(64'($signed(h1_r)) * 64'($signed(hp1)), 14);
                         wide_sum = t0 + t1 + $signed(r_r);
                         s_r <= sat40(wide_sum);
-                        if (!fits40(wide_sum)) overflow_seen <= 1'b1;
+                        if (!fits40(wide_sum)) begin overflow_seen <= 1'b1; overflow_stage <= 8'd13; end
                         if (wide_sum <= 0) begin
                             error_status <= 1'b1;
                             state <= ST_ERROR;
@@ -296,13 +304,19 @@ module kalman_2state_ip (
                     ST_GAIN: begin
                         // K raw Q15 = (PH^T raw Q30 * 2^15) / S raw Q30.
                         // PH^T is [hp0 hp1]^T because P is symmetric.
-                        t0 = ($signed(hp0) <<< 15) / $signed(s_r);
-                        t1 = ($signed(hp1) <<< 15) / $signed(s_r);
+                        // Widen BEFORE shifting: a shift keeps the left operand's width.
+                        gain_num0 = {{24{hp0[39]}}, hp0};
+                        gain_num1 = {{24{hp1[39]}}, hp1};
+                        gain_num0 = gain_num0 <<< 15;
+                        gain_num1 = gain_num1 <<< 15;
+
+                        t0 = gain_num0 / $signed(s_r);
+                        t1 = gain_num1 / $signed(s_r);
                         k0_r <= sat16(t0);
                         k1_r <= sat16(t1);
                         if (!((t0 <= 32767) && (t0 >= -32768)) ||
                             !((t1 <= 32767) && (t1 >= -32768)))
-                            overflow_seen <= 1'b1;
+                            begin overflow_seen <= 1'b1; overflow_stage <= 8'd14; end
                         state <= ST_UPDATE_X;
                     end
 
@@ -312,13 +326,13 @@ module kalman_2state_ip (
                         wide_sum = $signed(x0_pred) + t0;
                         x0_next <= sat16(wide_sum);
                         if (!((wide_sum <= 32767) && (wide_sum >= -32768)))
-                            overflow_seen <= 1'b1;
+                            begin overflow_seen <= 1'b1; overflow_stage <= 8'd15; end
 
                         t1 = round_shift(64'($signed(k1_r)) * 64'($signed(innov_r)), 15);
                         wide_sum = $signed(x1_pred) + t1;
                         x1_next <= sat16(wide_sum);
                         if (!((wide_sum <= 32767) && (wide_sum >= -32768)))
-                            overflow_seen <= 1'b1;
+                            begin overflow_seen <= 1'b1; overflow_stage <= 8'd16; end
                         state <= ST_UPDATE_P;
                     end
 
@@ -327,17 +341,17 @@ module kalman_2state_ip (
                         t0 = round_shift(64'($signed(k0_r)) * 64'($signed(hp0)), 15);
                         wide_sum = $signed(pp00) - t0;
                         p00_next <= sat40(wide_sum);
-                        if (!fits40(wide_sum)) overflow_seen <= 1'b1;
+                        if (!fits40(wide_sum)) begin overflow_seen <= 1'b1; overflow_stage <= 8'd17; end
 
                         t1 = round_shift(64'($signed(k0_r)) * 64'($signed(hp1)), 15);
                         wide_sum = $signed(pp01) - t1;
                         p01_next <= sat40(wide_sum);
-                        if (!fits40(wide_sum)) overflow_seen <= 1'b1;
+                        if (!fits40(wide_sum)) begin overflow_seen <= 1'b1; overflow_stage <= 8'd18; end
 
                         t2 = round_shift(64'($signed(k1_r)) * 64'($signed(hp1)), 15);
                         wide_sum = $signed(pp11) - t2;
                         p11_next <= sat40(wide_sum);
-                        if (!fits40(wide_sum)) overflow_seen <= 1'b1;
+                        if (!fits40(wide_sum)) begin overflow_seen <= 1'b1; overflow_stage <= 8'd19; end
                         state <= ST_COMMIT;
                     end
 

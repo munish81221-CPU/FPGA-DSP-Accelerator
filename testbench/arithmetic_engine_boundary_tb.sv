@@ -1,257 +1,235 @@
 `timescale 1ns/1ps
 
-// Boundary-focused self-checking testbench for arithmetic_engine.
-// Covers Q1.15 ADD/SUB saturation, MUL rounding/saturation, accumulator
-// readback, MAC accumulation, reset, and command handshake behavior.
-//
-// Intended configuration: DATA_W=16, ACC_W=40.
-module arithmetic_engine_boundary_tb;
+// KAL-004F-DIAG: Diagnostic version of the constrained-random Kalman test.
+// It preserves the original stimulus and assertions, and prints the complete
+// failing transaction inputs/outputs whenever overflow_seen is unexpectedly 1.
+// Run from project root:
+// iverilog -g2012 -s kalman_2state_random_tb -o kalman_random_diag rtl/kalman_2state_ip.sv testbench/kalman_2state_random_tb.sv
+// vvp kalman_random_diag
 
-    localparam logic [2:0] OP_MUL       = 3'b000;
-    localparam logic [2:0] OP_MAC       = 3'b001;
-    localparam logic [2:0] OP_ADD       = 3'b010;
-    localparam logic [2:0] OP_SUB       = 3'b011;
-    localparam logic [2:0] OP_ACC_CLEAR = 3'b100;
-    localparam logic [2:0] OP_ACC_READ  = 3'b101;
+module kalman_2state_random_tb;
+    logic clk = 1'b0;
+    logic rst_n = 1'b0;
+    logic init_valid = 1'b0;
+    logic signed [15:0] init_x0 = '0, init_x1 = '0;
+    logic signed [39:0] init_p00 = '0, init_p01 = '0, init_p11 = '0;
+    logic start = 1'b0;
+    logic busy, done, error_status, overflow_seen;
+    logic signed [15:0] cfg_f00 = 16'sd16384;
+    logic signed [15:0] cfg_f01 = '0, cfg_f10 = '0, cfg_f11 = 16'sd16384;
+    logic signed [39:0] cfg_q00 = '0, cfg_q01 = '0, cfg_q11 = '0;
+    logic signed [15:0] cfg_h0 = 16'sd16384, cfg_h1 = '0;
+    logic signed [39:0] cfg_r = 40'sd10737418;
+    logic signed [15:0] measurement = '0;
+    logic signed [15:0] state0, state1;
+    logic signed [39:0] p00, p01, p11;
 
-    logic clk;
-    logic rst_n;
-    logic cmd_valid;
-    logic cmd_ready;
-    logic [2:0] opcode;
-    logic signed [15:0] operand_a;
-    logic signed [15:0] operand_b;
+    integer checks = 0, failures = 0;
+    integer scenario_idx, step_idx, transactions = 0, timeout;
+    integer rand_a, rand_b, rand_c, rand_d;
+    integer signed_f01, signed_f10, signed_h1;
+    integer seed = 32'h51A7F00D;
+    real rp00, rp01, rp11, determinant, psd_tolerance;
 
-    logic signed [15:0] result;
-    logic signed [39:0] accumulator_value;
-    logic result_valid;
-    logic busy;
-    logic overflow;
+    localparam logic signed [39:0] Q30_TENTH     = 40'sd107374182;
+    localparam logic signed [39:0] Q30_HUNDREDTH = 40'sd10737418;
+    localparam logic signed [39:0] Q30_001       = 40'sd1073742;
+    localparam logic signed [39:0] Q30_0005      = 40'sd536871;
 
-    integer checks;
-    integer failures;
-
-    arithmetic_engine #(
-        .DATA_W(16),
-        .ACC_W(40)
-    ) dut (
-        .clk(clk),
-        .rst_n(rst_n),
-        .cmd_valid(cmd_valid),
-        .cmd_ready(cmd_ready),
-        .opcode(opcode),
-        .operand_a(operand_a),
-        .operand_b(operand_b),
-        .result(result),
-        .accumulator_value(accumulator_value),
-        .result_valid(result_valid),
-        .busy(busy),
-        .overflow(overflow)
-    );
-
-    initial clk = 1'b0;
     always #5 clk = ~clk;
 
-    // A watchdog prevents a broken handshake from hanging simulation.
-    initial begin
-        #200000;
-        $display("FAIL: global watchdog expired");
-        $fatal(1);
-    end
-
-    task automatic check_result(
-        input string label,
-        input logic signed [15:0] expected_result,
-        input logic expected_overflow
+    kalman_2state_ip dut (
+        .clk(clk), .rst_n(rst_n),
+        .init_valid(init_valid), .init_x0(init_x0), .init_x1(init_x1),
+        .init_p00(init_p00), .init_p01(init_p01), .init_p11(init_p11),
+        .start(start), .busy(busy), .done(done),
+        .error_status(error_status), .overflow_seen(overflow_seen),
+        .cfg_f00(cfg_f00), .cfg_f01(cfg_f01), .cfg_f10(cfg_f10), .cfg_f11(cfg_f11),
+        .cfg_q00(cfg_q00), .cfg_q01(cfg_q01), .cfg_q11(cfg_q11),
+        .cfg_h0(cfg_h0), .cfg_h1(cfg_h1), .cfg_r(cfg_r),
+        .measurement(measurement), .state0(state0), .state1(state1),
+        .p00(p00), .p01(p01), .p11(p11)
     );
+
+    task automatic check(input logic condition, input string label);
         begin
             checks = checks + 1;
-            if ((result !== expected_result) || (overflow !== expected_overflow)) begin
-                failures = failures + 1;
-                $error("%s: expected result=%0d (0x%04h), overflow=%b; got result=%0d (0x%04h), overflow=%b",
-                       label, expected_result, expected_result,
-                       expected_overflow, result, result, overflow);
-                $fatal(1, "Boundary check failed");
-            end else begin
-                $display("PASS %-34s result=%0d (0x%04h) overflow=%b",
-                         label, result, result, overflow);
-            end
+            if (condition === 1'b1) $display("PASS %s", label);
+            else begin failures = failures + 1; $display("FAIL %s", label); end
         end
     endtask
 
-    task automatic check_accumulator(
-        input string label,
-        input logic signed [39:0] expected_accumulator
-    );
-        begin
-            checks = checks + 1;
-            if (accumulator_value !== expected_accumulator) begin
-                failures = failures + 1;
-                $error("%s: expected accumulator=%0d (0x%010h), got %0d (0x%010h)",
-                       label, expected_accumulator, expected_accumulator,
-                       accumulator_value, accumulator_value);
-                $fatal(1, "Accumulator check failed");
-            end else begin
-                $display("PASS %-34s accumulator=%0d (0x%010h)",
-                         label, accumulator_value, accumulator_value);
-            end
-        end
-    endtask
-
-    task automatic issue_command(
-        input logic [2:0] op_value,
-        input logic signed [15:0] a_value,
-        input logic signed [15:0] b_value
-    );
-        integer wait_cycles;
-        begin
-            // Drive inputs away from the active clock edge.
-            @(negedge clk);
-            wait_cycles = 0;
-            while (cmd_ready !== 1'b1) begin
-                @(negedge clk);
-                wait_cycles = wait_cycles + 1;
-                if (wait_cycles > 10)
-                    $fatal(1, "Timeout waiting for cmd_ready");
-            end
-
-            opcode    = op_value;
-            operand_a = a_value;
-            operand_b = b_value;
-            cmd_valid = 1'b1;
-
-            // The engine samples the command on the next rising edge.
-            @(negedge clk);
-            cmd_valid = 1'b0;
-
-            wait_cycles = 0;
-            while (result_valid !== 1'b1) begin
-                @(negedge clk);
-                wait_cycles = wait_cycles + 1;
-                if (wait_cycles > 10)
-                    $fatal(1, "Timeout waiting for result_valid, opcode=%b", op_value);
-            end
-            // Completion outputs are registered on the preceding posedge and
-            // remain stable through this negedge.
-            #1;
-        end
-    endtask
-
-    task automatic reset_engine;
+    task automatic reset_dut;
         begin
             @(negedge clk);
-            rst_n = 1'b0;
-            cmd_valid = 1'b0;
-            opcode = OP_ACC_CLEAR;
-            operand_a = '0;
-            operand_b = '0;
-            repeat (2) @(negedge clk);
+            rst_n = 1'b0; start = 1'b0; init_valid = 1'b0;
+            repeat (3) @(negedge clk);
             rst_n = 1'b1;
             @(negedge clk);
         end
     endtask
 
+    task automatic initialize_random_case;
+        begin
+            rand_a = $urandom(seed) & 32'h7fffffff; seed = rand_a;
+            rand_b = $urandom(seed) & 32'h7fffffff; seed = rand_b;
+            rand_c = $urandom(seed) & 32'h7fffffff; seed = rand_c;
+            rand_d = $urandom(seed) & 32'h7fffffff; seed = rand_d;
+            cfg_f00 = 16'sd12288 + (rand_a % 4097);
+            cfg_f11 = 16'sd12288 + (rand_b % 4097);
+            signed_f01 = (rand_c % 2049) - 1024;
+            signed_f10 = (rand_d % 2049) - 1024;
+            cfg_f01 = signed_f01; cfg_f10 = signed_f10;
+
+            rand_a = $urandom(seed) & 32'h7fffffff; seed = rand_a;
+            rand_b = $urandom(seed) & 32'h7fffffff; seed = rand_b;
+            cfg_q00 = Q30_0005 + (rand_a % 5368709);
+            cfg_q01 = '0;
+            cfg_q11 = Q30_0005 + (rand_b % 5368709);
+
+            rand_c = $urandom(seed) & 32'h7fffffff; seed = rand_c;
+            rand_d = $urandom(seed) & 32'h7fffffff; seed = rand_d;
+            cfg_h0 = 16'sd12288 + (rand_c % 8193);
+            signed_h1 = (rand_d % 8193) - 4096;
+            cfg_h1 = signed_h1;
+            cfg_r = Q30_HUNDREDTH + ((rand_a % 4) * Q30_001);
+
+            rand_a = $urandom(seed) & 32'h7fffffff; seed = rand_a;
+            rand_b = $urandom(seed) & 32'h7fffffff; seed = rand_b;
+            init_p00 = Q30_TENTH / 5 + (rand_a % (Q30_TENTH + 1));
+            init_p01 = '0;
+            init_p11 = Q30_TENTH / 5 + (rand_b % (Q30_TENTH + 1));
+
+            rand_c = $urandom(seed) & 32'h7fffffff; seed = rand_c;
+            rand_d = $urandom(seed) & 32'h7fffffff; seed = rand_d;
+            init_x0 = (rand_c % 12001) - 6000;
+            init_x1 = (rand_d % 12001) - 6000;
+        end
+    endtask
+
+    task automatic apply_initialization;
+        begin
+            @(negedge clk); init_valid = 1'b1;
+            @(negedge clk); init_valid = 1'b0;
+            @(negedge clk);
+        end
+    endtask
+
+    task automatic dump_overflow_diagnostic(input integer sc, input integer st,
+                                              input logic signed [15:0] z);
+        begin
+            $display("");
+            $display("========== KAL-004F OVERFLOW DIAGNOSTIC ==========");
+            $display("scenario=%0d step=%0d measurement_raw=%0d (Q1.15=%0.7f)",
+                     sc, st, $signed(z), $itor($signed(z))/32768.0);
+            $display("F raw: f00=%0d f01=%0d f10=%0d f11=%0d",
+                     $signed(cfg_f00), $signed(cfg_f01), $signed(cfg_f10), $signed(cfg_f11));
+            $display("F real: f00=%0.7f f01=%0.7f f10=%0.7f f11=%0.7f",
+                     $itor($signed(cfg_f00))/16384.0, $itor($signed(cfg_f01))/16384.0,
+                     $itor($signed(cfg_f10))/16384.0, $itor($signed(cfg_f11))/16384.0);
+            $display("Q raw: q00=%0d q01=%0d q11=%0d",
+                     $signed(cfg_q00), $signed(cfg_q01), $signed(cfg_q11));
+            $display("Q real: q00=%0.9f q01=%0.9f q11=%0.9f",
+                     $itor($signed(cfg_q00))/1073741824.0,
+                     $itor($signed(cfg_q01))/1073741824.0,
+                     $itor($signed(cfg_q11))/1073741824.0);
+            $display("H raw: h0=%0d h1=%0d; H real: h0=%0.7f h1=%0.7f",
+                     $signed(cfg_h0), $signed(cfg_h1),
+                     $itor($signed(cfg_h0))/16384.0, $itor($signed(cfg_h1))/16384.0);
+            $display("R raw=%0d (Q30=%0.9f)", $signed(cfg_r), $itor($signed(cfg_r))/1073741824.0);
+            $display("initial x raw=(%0d,%0d), real=(%0.7f,%0.7f)",
+                     $signed(init_x0), $signed(init_x1),
+                     $itor($signed(init_x0))/32768.0, $itor($signed(init_x1))/32768.0);
+            $display("initial P raw=(%0d,%0d,%0d), real=(%0.9f,%0.9f,%0.9f)",
+                     $signed(init_p00), $signed(init_p01), $signed(init_p11),
+                     $itor($signed(init_p00))/1073741824.0,
+                     $itor($signed(init_p01))/1073741824.0,
+                     $itor($signed(init_p11))/1073741824.0);
+            $display("outputs x raw=(%0d,%0d), real=(%0.7f,%0.7f)",
+                     $signed(state0), $signed(state1),
+                     $itor($signed(state0))/32768.0, $itor($signed(state1))/32768.0);
+            $display("outputs P raw=(%0d,%0d,%0d), real=(%0.9f,%0.9f,%0.9f)",
+                     $signed(p00), $signed(p01), $signed(p11),
+                     $itor($signed(p00))/1073741824.0,
+                     $itor($signed(p01))/1073741824.0,
+                     $itor($signed(p11))/1073741824.0);
+            $display("status: done=%b busy=%b error=%b overflow=%b; seed_state=0x%08h",
+                     done, busy, error_status, overflow_seen, seed);
+            $display("overflow_stage=%0d (0 means no overflow detected)", dut.overflow_stage);
+            $display("==================================================");
+            $display("");
+        end
+    endtask
+
+    task automatic run_transaction(input logic signed [15:0] z,
+                                   input integer sc, input integer st);
+        begin
+            @(negedge clk); measurement = z; start = 1'b1;
+            @(negedge clk); start = 1'b0;
+            timeout = 0;
+            while ((done !== 1'b1) && (timeout < 30)) begin
+                @(negedge clk); timeout = timeout + 1;
+            end
+
+            if (overflow_seen !== 1'b0)
+                dump_overflow_diagnostic(sc, st, z);
+
+            check(done === 1'b1, $sformatf("case %0d step %0d completes", sc, st));
+            check(busy === 1'b0, $sformatf("case %0d step %0d busy clears", sc, st));
+            check(error_status === 1'b0, $sformatf("case %0d step %0d no error", sc, st));
+            check(overflow_seen === 1'b0, $sformatf("case %0d step %0d no overflow", sc, st));
+
+            if (done === 1'b1) begin
+                transactions = transactions + 1;
+                check_covariance(sc, st);
+                check((state0 <= 16'sh7fff) && (state0 >= -16'sh8000),
+                      $sformatf("case %0d step %0d state0 is representable", sc, st));
+                check((state1 <= 16'sh7fff) && (state1 >= -16'sh8000),
+                      $sformatf("case %0d step %0d state1 is representable", sc, st));
+            end
+        end
+    endtask
+
+    task automatic check_covariance(input integer sc, input integer st);
+        begin
+            rp00 = $itor($signed(p00)) / 1073741824.0;
+            rp01 = $itor($signed(p01)) / 1073741824.0;
+            rp11 = $itor($signed(p11)) / 1073741824.0;
+            determinant = (rp00 * rp11) - (rp01 * rp01);
+            psd_tolerance = 0.000001;
+            check(p00 >= 0, $sformatf("case %0d step %0d P00 nonnegative", sc, st));
+            check(p11 >= 0, $sformatf("case %0d step %0d P11 nonnegative", sc, st));
+            check(determinant >= -psd_tolerance,
+                  $sformatf("case %0d step %0d covariance PSD", sc, st));
+            $display("      random[%0d,%0d] P=(%0.7f,%0.7f,%0.7f), det=%0.9f",
+                     sc, st, rp00, rp01, rp11, determinant);
+        end
+    endtask
+
     initial begin
-        rst_n = 1'b0;
-        cmd_valid = 1'b0;
-        opcode = OP_ACC_CLEAR;
-        operand_a = '0;
-        operand_b = '0;
-        checks = 0;
-        failures = 0;
-
-        repeat (3) @(negedge clk);
-        rst_n = 1'b1;
-        @(negedge clk);
-
-        $display("\n=== ADD saturation boundaries ===");
-        issue_command(OP_ADD, 16'sd32767, 16'sd1);
-        check_result("ADD positive overflow", 16'sd32767, 1'b1);
-
-        issue_command(OP_ADD, -16'sd32768, -16'sd1);
-        check_result("ADD negative overflow", -16'sd32768, 1'b1);
-
-        issue_command(OP_ADD, 16'sd32766, 16'sd1);
-        check_result("ADD positive exact limit", 16'sd32767, 1'b0);
-
-        issue_command(OP_ADD, -16'sd32767, -16'sd1);
-        check_result("ADD negative exact limit", -16'sd32768, 1'b0);
-
-        issue_command(OP_ADD, -16'sd1, 16'sd1);
-        check_result("ADD cancellation to zero", 16'sd0, 1'b0);
-
-        $display("\n=== SUB saturation boundaries ===");
-        issue_command(OP_SUB, -16'sd32768, 16'sd1);
-        check_result("SUB negative overflow", -16'sd32768, 1'b1);
-
-        issue_command(OP_SUB, 16'sd32767, -16'sd1);
-        check_result("SUB positive overflow", 16'sd32767, 1'b1);
-
-        issue_command(OP_SUB, 16'sd32766, -16'sd1);
-        check_result("SUB positive exact limit", 16'sd32767, 1'b0);
-
-        issue_command(OP_SUB, -16'sd32767, 16'sd1);
-        check_result("SUB negative exact limit", -16'sd32768, 1'b0);
-
-        issue_command(OP_SUB, -16'sd1234, -16'sd1234);
-        check_result("SUB equal operands", 16'sd0, 1'b0);
-
-        $display("\n=== MUL rounding and saturation ===");
-        // Product is signed Q30. The product is converted to Q1.15 by the DUT.
-        // These operands target the half-LSB and near-limit neighborhoods.
-        issue_command(OP_MUL, 16'sd1, 16'sd16383);
-        check_result("MUL below positive half-LSB", 16'sd0, 1'b0);
-
-        issue_command(OP_MUL, 16'sd1, 16'sd16384);
-        check_result("MUL positive half-LSB", 16'sd1, 1'b0);
-
-        issue_command(OP_MUL, 16'sd1, 16'sd16385);
-        check_result("MUL above positive half-LSB", 16'sd1, 1'b0);
-
-        issue_command(OP_MUL, -16'sd1, 16'sd16383);
-        check_result("MUL above negative half-LSB", 16'sd0, 1'b0);
-
-        issue_command(OP_MUL, -16'sd1, 16'sd16384);
-        check_result("MUL negative half-LSB", -16'sd1, 1'b0);
-
-        issue_command(OP_MUL, -16'sd1, 16'sd16385);
-        check_result("MUL below negative half-LSB", -16'sd1, 1'b0);
-
-        issue_command(OP_MUL, 16'sh8000, 16'sh8000);
-        check_result("MUL min times min saturation", 16'sd32767, 1'b1);
-
-        issue_command(OP_MUL, 16'sh7FFF, 16'sh7FFF);
-        check_result("MUL max times max", 16'sd32766, 1'b0);
-
-        issue_command(OP_MUL, 16'sh8000, 16'sh7FFF);
-        check_result("MUL negative extreme product", -16'sd32767, 1'b0);
-
-        $display("\n=== MAC accumulation and readback ===");
-        issue_command(OP_ACC_CLEAR, 16'sd0, 16'sd0);
-        check_result("ACC_CLEAR result", 16'sd0, 1'b0);
-        check_accumulator("ACC_CLEAR accumulator", 40'sd0);
-
-        issue_command(OP_MAC, 16'sh7FFF, 16'sh7FFF);
-        check_result("MAC one positive product", 16'sd32766, 1'b0);
-        check_accumulator("MAC raw Q30 accumulator", 40'sd1073676289);
-
-        issue_command(OP_ACC_READ, 16'sd0, 16'sd0);
-        check_result("ACC_READ converted result", 16'sd32766, 1'b0);
-        check_accumulator("ACC_READ preserves accumulator", 40'sd1073676289);
-
-        // Accumulator may exceed Q1.15 output range without overflowing 40 bits.
-        issue_command(OP_MAC, 16'sh8000, 16'sh8000);
-        check_result("MAC output saturates only", 16'sd32767, 1'b1);
-        check_accumulator("MAC retains wide accumulated sum", 40'sd2147418113);
-
-        $display("\n=== Reset recovery ===");
-        reset_engine();
-        check_accumulator("Reset clears accumulator", 40'sd0);
-        issue_command(OP_ADD, 16'sd123, -16'sd23);
-        check_result("ADD after reset", 16'sd100, 1'b0);
-
-        $display("\nALL ARITHMETIC ENGINE BOUNDARY CHECKS PASSED: %0d checks", checks);
+        $display("KAL-004F-DIAG: constrained-random Kalman robustness regression");
+        $display("Seed initialization = 0x%08h", seed);
+        reset_dut();
+        for (scenario_idx = 0; scenario_idx < 30; scenario_idx = scenario_idx + 1) begin
+            reset_dut();
+            initialize_random_case();
+            apply_initialization();
+            check(p00 >= 0, $sformatf("case %0d initialized P00 nonnegative", scenario_idx));
+            check(p11 >= 0, $sformatf("case %0d initialized P11 nonnegative", scenario_idx));
+            check_covariance(scenario_idx, -1);
+            for (step_idx = 0; step_idx < 3; step_idx = step_idx + 1) begin
+                rand_a = $urandom(seed) & 32'h7fffffff; seed = rand_a;
+                measurement = (rand_a % 12001) - 6000;
+                run_transaction(measurement, scenario_idx, step_idx);
+            end
+        end
+        $display("");
+        $display("KAL-004F-DIAG SUMMARY: scenarios=30 transactions=%0d checks=%0d failures=%0d",
+                 transactions, checks, failures);
+        if ((failures == 0) && (transactions == 90))
+            $display("ALL KAL-004F DIAGNOSTIC CHECKS PASSED");
+        else
+            $display("KAL-004F DIAGNOSTIC FAILURES REMAIN");
         $finish;
     end
-
 endmodule
