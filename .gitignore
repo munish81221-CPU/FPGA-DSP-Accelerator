@@ -1,0 +1,15 @@
+# Icarus Verilog simulation executables
+*.vvp
+/*_sim
+/kal_*
+/kalman_*
+/adaptive_sim
+/arithmetic_boundary_sim
+/arithmetic_sim
+/boundary_sim
+/divider_sim
+/lms_sim
+/reference_sim
+
+# Generated regression logs
+build/kal004l/logs/
